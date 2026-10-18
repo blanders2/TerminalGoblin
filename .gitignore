@@ -10,3 +10,6 @@ __pycache__/
 
 # PatchGoblin's task metadata. Remove this line to commit and sync tasks.
 .patchgoblin/
+
+# Rust build output
+/target/

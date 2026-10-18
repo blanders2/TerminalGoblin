@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1d2331"/>
+      <stop offset="1" stop-color="#0e1116"/>
+    </linearGradient>
+    <linearGradient id="ear" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#a6f3a8"/>
+      <stop offset="1" stop-color="#4caf61"/>
+    </linearGradient>
+  </defs>
+  <!-- Goblin ears -->
+  <path d="M20 42 L1 22 Q4 50 20 72 Z" fill="url(#ear)"/>
+  <path d="M108 42 L127 22 Q124 50 108 72 Z" fill="url(#ear)"/>
+  <!-- Terminal body -->
+  <rect x="14" y="18" width="100" height="92" rx="22" fill="url(#bg)"/>
+  <rect x="15" y="19" width="98" height="90" rx="21" fill="none" stroke="#7ee787" stroke-opacity="0.35" stroke-width="2"/>
+  <!-- Prompt -->
+  <path d="M38 54 L54 66 L38 78" fill="none" stroke="#7ee787" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="62" y="74" width="28" height="8" rx="4" fill="#7ee787"/>
+</svg>

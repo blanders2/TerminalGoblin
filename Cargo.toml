@@ -1,0 +1,29 @@
+[package]
+name = "terminalgoblin"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alacritty_terminal = "0.26.0"
+anyhow = "1.0.104"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+cosmic-text = "0.19.0"
+dirs = "7.0.0"
+env_logger = "0.11.11"
+log = "0.4.34"
+png = "0.18.1"
+pollster = "1.0.1"
+raw-window-handle = "0.6.2"
+serde = { version = "1.0.229", features = ["derive"] }
+smithay-clipboard = "0.7.3"
+toml = "1.1.8"
+toml_edit = "0.25.17"
+wgpu = "30.0.1"
+winit = { version = "0.30", default-features = false, features = ["wayland", "wayland-dlopen", "wayland-csd-adwaita", "rwh_06"] }
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

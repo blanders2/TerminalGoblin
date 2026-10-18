@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=TerminalGoblin
+GenericName=Terminal
+Comment=Tabbed, splittable GPU terminal for Wayland
+Exec=terminalgoblin
+Icon=terminalgoblin
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=shell;prompt;command;commandline;cmd;terminal;
+StartupWMClass=terminalgoblin
+StartupNotify=true
