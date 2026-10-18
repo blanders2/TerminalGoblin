@@ -97,6 +97,37 @@ tab_color = "#7ee787"
 
 See the generated file for every option, every action name, and a template for custom color schemes.
 
+## Remote control and PatchGoblin
+
+Running TerminalGoblin windows can be controlled from scripts, which is how
+[PatchGoblin](../PatchGoblin) opens a named, colored tab per project and finds it again (pick
+**TerminalGoblin** or *Automatic* under PatchGoblin's Settings → Terminal → Terminal tabs on Linux).
+
+```sh
+terminalgoblin @ launch --cwd ~/code/app --title "App" --color "#2e9e6b" --env PATCHGOBLIN_TAB=p1
+terminalgoblin @ launch --title "api (me@server)" -- ssh -t me@server "cd /srv/api && exec \$SHELL -l"
+terminalgoblin @ focus --match env:PATCHGOBLIN_TAB=p1
+terminalgoblin @ set-tab-color --match title:App "#d9822b"
+terminalgoblin @ ls        # JSON: every window's tabs and panes, with their launch environment
+```
+
+- `@ launch` opens a tab in the most recently used window, or starts TerminalGoblin with that tab
+  if it isn't running. It works from background services too, and finds the Wayland display
+  itself if `WAYLAND_DISPLAY` isn't set. `--type split-right|split-down` opens a split instead,
+  and `--group NAME` puts the tab in a tab group.
+- A `--title` stays put: shells and remote sessions setting their own title don't change it.
+- `--match` takes `env:KEY=VALUE`, `id:PANE`, `tab:TAB` or `title:TEXT`. Panes are found by
+  their launch environment even after they've been joined into another tab as a split.
+- Splitting or duplicating a tab that runs a command (such as `ssh`) runs the same command again,
+  so an SSH project's split is another session in the same remote directory.
+- If such a command fails, its pane stays open showing the error: **Enter** closes it and **r**
+  runs it again (handy for reconnecting). Shells close their pane as usual.
+- `terminalgoblin -e COMMAND…` and the other launch options also work like this, so tools that
+  open "a terminal" get a tab in your TerminalGoblin window. `--new-instance` forces a new
+  window.
+- Each pane has `$TERMINALGOBLIN_PANE_ID` and `$TERMINALGOBLIN_SOCKET`. The sockets live in
+  `$XDG_RUNTIME_DIR/terminalgoblin/`, one per window, readable only by you.
+
 ## Development
 
 ```sh
@@ -113,6 +144,7 @@ cargo run -- --demo --screenshot /tmp/shot.png
 | `settings.rs` | The settings window and keybinding editor |
 | `renderer.rs`, `shader.wgsl` | One instanced wgpu pipeline for rounded rects, shadows and glyphs |
 | `text.rs` | Font metrics, shaping, glyph atlas, built-in box drawing |
+| `ipc.rs`, `remote.rs` | Remote-control socket, the `@` client, and the request handlers |
 | `pane.rs` | A terminal: `alacritty_terminal::Term` plus its PTY thread |
 | `layout.rs` | Split tree, divider dragging, directional focus |
 | `workspace.rs` | Tabs, groups and their invariants |

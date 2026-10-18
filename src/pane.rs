@@ -1,6 +1,7 @@
 //! A terminal pane: an alacritty_terminal `Term` plus the PTY event loop feeding it.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -17,10 +18,19 @@ use crate::config::{Config, Profile};
 
 pub type PaneId = u64;
 
+/// How a pane is started beyond its profile: a different command (e.g. `ssh host ...`) and extra
+/// environment (e.g. PatchGoblin's `PATCHGOBLIN_TAB`). Splits and duplicates reuse it.
+#[derive(Clone, Debug, Default)]
+pub struct PaneLaunch {
+    pub command: Option<(String, Vec<String>)>,
+    pub env: HashMap<String, String>,
+}
+
 #[derive(Debug)]
 pub enum UserEvent {
     Term(PaneId, Event),
     ConfigChanged,
+    Ipc(crate::ipc::Request),
 }
 
 #[derive(Clone)]
@@ -65,6 +75,9 @@ pub struct Pane {
     pub color: Option<crate::theme::Color>,
     /// Font size override in logical pixels; `None` uses the configured default.
     pub font_size: Option<f32>,
+    pub launch: PaneLaunch,
+    /// Set when a launched command failed: the pane stays open showing why.
+    pub exited: Option<String>,
     pub grid: GridSize,
     child_pid: u32,
     /// Accumulated fractional scroll from touchpads.
@@ -96,18 +109,28 @@ impl Pane {
         profile_index: usize,
         profile: &Profile,
         cwd: Option<PathBuf>,
+        launch: PaneLaunch,
         grid: GridSize,
         cell: (f32, f32),
         proxy: EventLoopProxy<UserEvent>,
     ) -> anyhow::Result<Pane> {
         let mut env = profile.env.clone();
+        env.extend(launch.env.clone());
         env.insert("TERM_PROGRAM".into(), "TerminalGoblin".into());
         env.insert("TERM_PROGRAM_VERSION".into(), env!("CARGO_PKG_VERSION").into());
+        env.insert("TERMINALGOBLIN_PANE_ID".into(), id.to_string());
+        if let Some(sock) = crate::ipc::socket_path() {
+            env.insert("TERMINALGOBLIN_SOCKET".into(), sock.to_string_lossy().into_owned());
+        }
         let working_directory = cwd.or_else(|| profile.cwd.clone()).or_else(dirs::home_dir);
+        let (program, args) = launch
+            .command
+            .clone()
+            .unwrap_or_else(|| (profile.command.clone(), profile.args.clone()));
         let options = tty::Options {
-            shell: Some(tty::Shell::new(profile.command.clone(), profile.args.clone())),
+            shell: Some(tty::Shell::new(program, args)),
             working_directory,
-            drain_on_exit: false,
+            drain_on_exit: true,
             env,
         };
         let window_size = window_size(grid, cell);
@@ -115,7 +138,8 @@ impl Pane {
         let child_pid = pty.child().id();
         let listener = EventProxy { id, proxy };
         let term = Arc::new(FairMutex::new(Term::new(term_config(cfg), &grid, listener.clone())));
-        let event_loop = EventLoop::new(term.clone(), listener, pty, false, false)?;
+        // Drain on exit so a failing command's last words (e.g. ssh's error) reach the screen.
+        let event_loop = EventLoop::new(term.clone(), listener, pty, true, false)?;
         let notifier = event_loop.channel();
         event_loop.spawn();
         Ok(Pane {
@@ -128,6 +152,8 @@ impl Pane {
             label: None,
             color: None,
             font_size: None,
+            launch,
+            exited: None,
             grid,
             child_pid,
             scroll_accum: 0.0,
@@ -150,6 +176,17 @@ impl Pane {
         let _ = self.notifier.send(Msg::Resize(window_size(grid, cell)));
     }
 
+    /// Write text to the screen as if the program had printed it.
+    pub fn print(&self, text: &str) {
+        let mut parser: alacritty_terminal::vte::ansi::Processor = Default::default();
+        parser.advance(&mut *self.term.lock(), text.as_bytes());
+    }
+
+    /// Process id of the program running in the pane.
+    pub fn pid(&self) -> u32 {
+        self.child_pid
+    }
+
     /// The shell's current working directory, used to open splits in the same place.
     pub fn cwd(&self) -> Option<PathBuf> {
         std::fs::read_link(format!("/proc/{}/cwd", self.child_pid)).ok()
@@ -159,10 +196,13 @@ impl Pane {
         if let Some(label) = self.label.as_deref().filter(|l| !l.trim().is_empty()) {
             return label;
         }
-        if self.title.trim().is_empty() {
-            &self.profile_name
-        } else {
-            &self.title
+        if !self.title.trim().is_empty() {
+            return &self.title;
+        }
+        // Until the program sets a title, name the tab after what it runs.
+        match &self.launch.command {
+            Some((program, _)) => program.rsplit('/').next().unwrap_or(program),
+            None => &self.profile_name,
         }
     }
 }

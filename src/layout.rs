@@ -82,6 +82,18 @@ impl Node {
         }
     }
 
+    /// Swap leaf `old` for leaf `new`.
+    pub fn replace(&mut self, old: PaneId, new: PaneId) -> bool {
+        match self {
+            Node::Leaf(id) if *id == old => {
+                *id = new;
+                true
+            }
+            Node::Leaf(_) => false,
+            Node::Split { a, b, .. } => a.replace(old, new) || b.replace(old, new),
+        }
+    }
+
     /// Put `node` next to leaf `target`: before it (left/up) or after it (right/down).
     pub fn insert(&mut self, target: PaneId, node: &mut Option<Node>, dir: Dir) -> bool {
         match self {

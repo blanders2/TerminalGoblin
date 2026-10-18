@@ -24,7 +24,7 @@ use winit::window::{CursorIcon, Fullscreen, ResizeDirection, UserAttentionType, 
 use crate::config::{self, Action, Config, KeyCombo, Profile};
 use crate::input::{self, MouseButtonCode};
 use crate::layout::{self, Axis, Dir, Divider, Node};
-use crate::pane::{GridSize, Pane, PaneId, UserEvent};
+use crate::pane::{GridSize, Pane, PaneId, PaneLaunch, UserEvent};
 use crate::renderer::{Instance, Rect, Renderer};
 use crate::text::TextSystem;
 use crate::theme::{self, Scheme, UiPalette};
@@ -42,6 +42,8 @@ pub struct Options {
     pub demo_menu: bool,
     pub demo_dock: bool,
     pub demo_settings: Option<String>,
+    /// First tab to open instead of the default shell (from the command line).
+    pub launch: Option<crate::ipc::LaunchSpec>,
 }
 
 pub struct App {
@@ -122,6 +124,9 @@ pub struct State {
     last_report_cell: Option<(PaneId, usize, usize)>,
     reported_button: Option<MouseButtonCode>,
     pub screenshot: Option<(PathBuf, Instant)>,
+    /// When the window last gained focus (seconds since the epoch), so `@ launch` picks the
+    /// most recently used window.
+    pub focused_at: f64,
     pub exit: bool,
 }
 
@@ -130,7 +135,15 @@ impl ApplicationHandler<UserEvent> for App {
         if self.st.is_some() {
             return;
         }
-        match State::new(event_loop, self.cfg.clone(), self.proxy.clone()) {
+        if let Err(e) = crate::ipc::serve(self.proxy.clone()) {
+            log::warn!("remote control unavailable: {e}");
+        }
+        match State::new(
+            event_loop,
+            self.cfg.clone(),
+            self.proxy.clone(),
+            self.opts.launch.take(),
+        ) {
             Ok(mut st) => {
                 if let Some(e) = self.startup_error.take() {
                     st.show_toast(e);
@@ -174,6 +187,10 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::Term(id, ev) => st.handle_term_event(id, ev),
             UserEvent::ConfigChanged => st.reload_config(),
+            UserEvent::Ipc(req) => {
+                let reply = st.handle_ipc(req.body);
+                let _ = req.reply.send(reply);
+            }
         }
         if st.exit {
             event_loop.exit();
@@ -181,6 +198,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        crate::ipc::cleanup();
         // Tear down while the Wayland connection is still alive: the clipboard and GPU surface
         // hold raw pointers into it.
         if let Some(mut st) = self.st.take() {
@@ -243,6 +261,7 @@ impl State {
         event_loop: &ActiveEventLoop,
         cfg: Config,
         proxy: EventLoopProxy<UserEvent>,
+        initial: Option<crate::ipc::LaunchSpec>,
     ) -> anyhow::Result<State> {
         let attrs = Window::default_attributes()
             .with_title("TerminalGoblin")
@@ -304,14 +323,23 @@ impl State {
             last_report_cell: None,
             reported_button: None,
             screenshot: None,
+            focused_at: unix_now(),
             exit: false,
             cfg,
         };
         if !st.renderer.supports_transparency {
             st.transparency_on = false;
         }
-        let profile = st.cfg.default_profile_index(&st.profiles);
-        st.new_tab(profile, None)?;
+        match initial.map(|spec| st.launch(spec)) {
+            Some(Ok(_)) => {}
+            other => {
+                if let Some(Err(e)) = other {
+                    st.show_toast(format!("Could not open the requested tab: {e}"));
+                }
+                let profile = st.cfg.default_profile_index(&st.profiles);
+                st.new_tab(profile, None)?;
+            }
+        }
         st.window.request_redraw();
         Ok(st)
     }
@@ -587,6 +615,7 @@ impl State {
         cwd: Option<PathBuf>,
         approx: Rect,
         font_size: Option<f32>,
+        launch: PaneLaunch,
     ) -> anyhow::Result<PaneId> {
         let id = self.ws.next_id();
         let profile_def = self
@@ -602,6 +631,7 @@ impl State {
             profile,
             &profile_def,
             cwd,
+            launch,
             grid,
             cell,
             self.proxy.clone(),
@@ -613,7 +643,7 @@ impl State {
 
     pub fn new_tab(&mut self, profile: usize, cwd: Option<PathBuf>) -> anyhow::Result<()> {
         let area = self.content_rect();
-        let pane = self.spawn_pane(profile, cwd, area, None)?;
+        let pane = self.spawn_pane(profile, cwd, area, None, PaneLaunch::default())?;
         let tab_id = self.ws.next_id();
         let color = self.profiles.get(profile).and_then(|p| p.tab_color);
         self.ws.insert_tab(Tab {
@@ -657,15 +687,21 @@ impl State {
         } else {
             Axis::Vertical
         });
-        let (profile, cwd, font_size) = match self.ws.panes.get(&focused) {
-            Some(p) => (p.profile, p.cwd(), p.font_size),
-            None => (self.cfg.default_profile_index(&self.profiles), None, None),
+        // A split runs what the focused pane runs: the same shell, or the same ssh session.
+        let (profile, cwd, font_size, launch) = match self.ws.panes.get(&focused) {
+            Some(p) => (p.profile, p.cwd(), p.font_size, p.launch.clone()),
+            None => (
+                self.cfg.default_profile_index(&self.profiles),
+                None,
+                None,
+                PaneLaunch::default(),
+            ),
         };
         let half = match axis {
             Axis::Horizontal => Rect::new(rect.x, rect.y, rect.w / 2.0, rect.h),
             Axis::Vertical => Rect::new(rect.x, rect.y, rect.w, rect.h / 2.0),
         };
-        match self.spawn_pane(profile, cwd, half, font_size) {
+        match self.spawn_pane(profile, cwd, half, font_size, launch) {
             Ok(new) => {
                 let tab = self.ws.active_tab_mut().unwrap();
                 tab.zoomed = false;
@@ -674,6 +710,37 @@ impl State {
                 self.after_structure_change();
             }
             Err(e) => self.show_toast(format!("Could not split: {e}")),
+        }
+    }
+
+    /// Run a pane's command again in the same place, keeping its name, color and text size.
+    pub(crate) fn restart_pane(&mut self, id: PaneId) {
+        let Some(old) = self.ws.panes.get(&id) else { return };
+        let (profile, cwd, font_size, launch) = (old.profile, old.cwd(), old.font_size, old.launch.clone());
+        let (label, color) = (old.label.clone(), old.color);
+        let rect = self
+            .pane_rects
+            .iter()
+            .find(|(p, _)| *p == id)
+            .map(|(_, r)| *r)
+            .unwrap_or(self.content_rect());
+        match self.spawn_pane(profile, cwd, rect, font_size, launch) {
+            Ok(new) => {
+                if let Some(p) = self.ws.panes.get_mut(&new) {
+                    p.label = label;
+                    p.color = color;
+                }
+                if let Some(ti) = self.ws.tab_of_pane(id) {
+                    let tab = &mut self.ws.tabs[ti];
+                    tab.root.replace(id, new);
+                    if tab.focused == id {
+                        tab.focused = new;
+                    }
+                }
+                self.ws.panes.remove(&id);
+                self.after_structure_change();
+            }
+            Err(e) => self.show_toast(format!("Could not restart: {e}")),
         }
     }
 
@@ -1073,9 +1140,14 @@ impl State {
                     return;
                 };
                 let focused = self.ws.tabs[i].focused;
-                let (profile, cwd) = match self.ws.panes.get(&focused) {
-                    Some(p) => (p.profile, p.cwd()),
-                    None => (self.cfg.default_profile_index(&self.profiles), None),
+                let (profile, cwd, launch, font_size) = match self.ws.panes.get(&focused) {
+                    Some(p) => (p.profile, p.cwd(), p.launch.clone(), p.font_size),
+                    None => (
+                        self.cfg.default_profile_index(&self.profiles),
+                        None,
+                        PaneLaunch::default(),
+                        None,
+                    ),
                 };
                 let (color, group, title) = (
                     self.ws.tabs[i].color,
@@ -1083,13 +1155,22 @@ impl State {
                     self.ws.tabs[i].custom_title.clone(),
                 );
                 self.ws.active = i;
-                self.new_tab_or_toast(profile, cwd);
-                if let Some(tab) = self.ws.active_tab_mut() {
-                    tab.color = color;
-                    tab.custom_title = title;
-                    if tab.group.is_none() {
-                        tab.group = group;
+                let area = self.content_rect();
+                match self.spawn_pane(profile, cwd, area, font_size, launch) {
+                    Ok(pane) => {
+                        let id = self.ws.next_id();
+                        self.ws.insert_tab(Tab {
+                            id,
+                            root: Node::Leaf(pane),
+                            focused: pane,
+                            custom_title: title,
+                            color,
+                            group,
+                            zoomed: false,
+                            bell: false,
+                        });
                     }
+                    Err(e) => self.show_toast(format!("Could not duplicate the tab: {e}")),
                 }
                 self.after_structure_change();
             }
@@ -1603,6 +1684,9 @@ impl State {
             }
             WindowEvent::Focused(f) => {
                 self.focused = f;
+                if f {
+                    self.focused_at = unix_now();
+                }
                 if let Some(id) = self.ws.active_tab().map(|t| t.focused) {
                     self.send_focus(id, f);
                 }
@@ -1723,8 +1807,26 @@ impl State {
                     self.window.request_redraw();
                 }
             }
-            TermEvent::Exit | TermEvent::ChildExit(_) => {
-                if self.ws.panes.contains_key(&id) {
+            TermEvent::ChildExit(status) => {
+                let Some(p) = self.ws.panes.get_mut(&id) else { return };
+                // Shells close their pane however they exit; a launched command (ssh, a
+                // PatchGoblin project, `-e`) that fails stays open so its error can be read.
+                if status.success() || p.launch.command.is_none() {
+                    self.close_pane(id);
+                    return;
+                }
+                let why = match status.code() {
+                    Some(code) => format!("exited with code {code}"),
+                    None => "was terminated".to_string(),
+                };
+                p.print(&format!(
+                    "\r\n\x1b[0;2m[process {why} · Enter closes · r restarts]\x1b[0m"
+                ));
+                p.exited = Some(why);
+                self.window.request_redraw();
+            }
+            TermEvent::Exit => {
+                if self.ws.panes.get(&id).is_some_and(|p| p.exited.is_none()) {
                     self.close_pane(id);
                 }
             }
@@ -1733,6 +1835,22 @@ impl State {
 
     pub(crate) fn on_key(&mut self, key: &Key, unmodified: &Key, text: Option<&str>) {
         self.last_input = Instant::now();
+
+        // A failed command's pane: Enter/Esc/q close it, r runs it again.
+        if self.edit.is_none()
+            && self.menu.is_none()
+            && self.settings.is_none()
+            && let Some(id) = self.ws.active_tab().map(|t| t.focused)
+            && self.ws.panes.get(&id).is_some_and(|p| p.exited.is_some())
+        {
+            match key {
+                Key::Named(NamedKey::Enter | NamedKey::Escape) => self.close_pane(id),
+                Key::Character(c) if c.eq_ignore_ascii_case("q") => self.close_pane(id),
+                Key::Character(c) if c.eq_ignore_ascii_case("r") => self.restart_pane(id),
+                _ => {}
+            }
+            return;
+        }
 
         if self.edit.is_some() {
             self.on_edit_key(key, text);
@@ -2408,6 +2526,13 @@ impl State {
             self.window.request_redraw();
         }
     }
+}
+
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 fn p_is_default(size: f32, default: f32) -> bool {

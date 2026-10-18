@@ -706,10 +706,12 @@ impl State {
     ) {
         let s = self.s();
         let ui = self.ui.clone();
-        out.push(Instance::rect(
-            header,
-            alpha(ui.text, if focused { 0.07 } else { 0.035 }),
-        ));
+        // A colored pane tints its whole header; otherwise a faint neutral wash.
+        let bg = match color {
+            Some(c) => alpha(c, if focused { 0.30 } else { 0.18 }),
+            None => alpha(ui.text, if focused { 0.07 } else { 0.035 }),
+        };
+        out.push(Instance::rect(header, bg));
         out.push(Instance::rect(
             Rect::new(header.x, header.bottom() - 1.0, header.w, 1.0),
             ui.border,
@@ -738,16 +740,7 @@ impl State {
         }
 
         let cy = header.center_y() + if color.is_some() { 1.0 * s } else { 0.0 };
-        let mut x = header.x + 10.0 * s;
-        if let Some(c) = color {
-            let d = (8.0 * s).round();
-            out.push(Instance::rounded(
-                Rect::new(x, (cy - d / 2.0).round(), d, d),
-                c,
-                d / 2.0,
-            ));
-            x += d + 7.0 * s;
-        }
+        let x = header.x + 10.0 * s;
         let font = (ui::UI_FONT - 0.5) * s;
         let name = match label {
             Some(l) if !l.trim().is_empty() => l.to_string(),
@@ -761,7 +754,7 @@ impl State {
         };
         let avail = header.right() - 10.0 * s - x;
         let name = self.text.ellipsize(&name, font, true, avail);
-        let w = self.text.draw_ui(
+        self.text.draw_ui(
             out,
             &name,
             x,
@@ -771,15 +764,6 @@ impl State {
             if focused { ui.text } else { ui.text_dim },
             header,
         );
-        // When the pane has a name, also show what's running in it.
-        if label.is_some() && !title.trim().is_empty() && Some(title) != label {
-            let tx = x + w + 8.0 * s;
-            let rest = self.text.ellipsize(title, font, false, header.right() - 10.0 * s - tx);
-            if !rest.is_empty() {
-                self.text
-                    .draw_ui(out, &rest, tx, cy, font, false, alpha(ui.text_dim, 0.8), header);
-            }
-        }
     }
 
     /// While a tab is dragged over the content: where it will dock, and a label at the cursor.
