@@ -1,0 +1,12 @@
+# Added by PatchGoblin when it created this repository.
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+.DS_Store
+
+# PatchGoblin's task metadata. Remove this line to commit and sync tasks.
+.patchgoblin/
