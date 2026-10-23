@@ -5,6 +5,7 @@
 
 mod app;
 mod config;
+mod desktop;
 mod draw;
 mod input;
 mod ipc;
@@ -32,6 +33,7 @@ that's already running (if there is one) instead of a new window.
   --env KEY=VALUE       Extra environment variable (repeatable)
   --group NAME          Put the tab in this tab group
   --profile NAME        Shell profile to use
+  --location NAME       Open the saved location NAME
   -e, -- COMMAND...     Run COMMAND instead of the shell
   --new-instance        Always open a new window
   @ COMMAND ...         Control a running TerminalGoblin (see `terminalgoblin @ help`)

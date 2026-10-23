@@ -18,6 +18,7 @@ pub const BUTTON: f32 = 30.0;
 pub const CONTROL_W: f32 = 40.0;
 pub const RESIZE_BORDER: f32 = 6.0;
 pub const PANE_HEADER: f32 = 24.0;
+pub const LOCATIONS_LABEL: &str = "Locations";
 
 /// Commands produced by menus and the tab bar.
 #[derive(Clone, Debug, PartialEq)]
@@ -48,6 +49,14 @@ pub enum Cmd {
     SetPaneColor(PaneId, Option<Color>),
     SetSetting(crate::settings::Setting, String),
     SetScheme(String),
+    /// Open saved location N in a new tab.
+    OpenLocation(usize),
+    /// Open a new tab with `ssh host`, in its home folder.
+    OpenSshHost(String),
+    /// Open settings on the Locations page.
+    ManageLocations,
+    /// Open settings with an editor for a new location.
+    AddLocation,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -57,6 +66,7 @@ pub enum Hit {
     Group(GroupId),
     NewTab,
     NewTabMenu,
+    Locations,
     Minimize,
     Maximize,
     Close,
@@ -74,6 +84,7 @@ pub struct TabBarLayout {
     pub items: Vec<BarItem>,
     pub new_tab: Rect,
     pub dropdown: Rect,
+    pub locations: Rect,
     pub controls: Option<[Rect; 3]>,
 }
 
@@ -109,6 +120,9 @@ impl TabBarLayout {
         }
         if self.dropdown.contains(x, y) {
             return Some(Hit::NewTabMenu);
+        }
+        if self.locations.contains(x, y) {
+            return Some(Hit::Locations);
         }
         for item in &self.items {
             match item {
@@ -162,7 +176,8 @@ pub fn layout_tabbar(
     let bar = Rect::new(0.0, 0.0, width, (BAR_H * s).round());
     let controls_w = if controls { CONTROL_W * s * 3.0 + 8.0 * s } else { 0.0 };
     let left = 8.0 * s;
-    let buttons_w = (BUTTON + 22.0 + 10.0) * s;
+    let locations_w = (text.measure(LOCATIONS_LABEL, UI_FONT * s, false) + 20.0 * s).round();
+    let buttons_w = (BUTTON + 22.0 + 10.0) * s + locations_w + 4.0 * s;
     let right_limit = width - controls_w - buttons_w - 12.0 * s;
 
     // Sequence of chips and visible tabs.
@@ -220,6 +235,7 @@ pub fn layout_tabbar(
     let by = top + (bar.h - top - bs) / 2.0;
     let new_tab = Rect::new(x + 4.0 * s, by, bs, bs);
     let dropdown = Rect::new(new_tab.right(), by, 22.0 * s, bs);
+    let locations = Rect::new(dropdown.right() + 4.0 * s, by, locations_w, bs);
     let controls = controls.then(|| {
         let cw = CONTROL_W * s;
         let ch = 30.0 * s;
@@ -236,6 +252,7 @@ pub fn layout_tabbar(
         items,
         new_tab,
         dropdown,
+        locations,
         controls,
     }
 }
@@ -245,6 +262,8 @@ pub enum EditTarget {
     Tab(TabId),
     Group(GroupId),
     Pane(PaneId),
+    /// A text field in the settings window.
+    Field,
 }
 
 /// Single-line text field used for renaming tabs and groups.

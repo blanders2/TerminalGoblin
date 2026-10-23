@@ -26,12 +26,14 @@ pub struct Config {
     pub copy_on_select: bool,
     pub decorations: String,
     pub default_profile: Option<String>,
+    pub detect_shells: bool,
     pub unfocused_pane_dim: f32,
     pub pane_headers: String,
     pub bold_is_bright: bool,
     pub profiles: Vec<ProfileDef>,
     pub color_schemes: Vec<SchemeDef>,
     pub keybindings: HashMap<String, String>,
+    pub locations: Vec<LocationDef>,
 }
 
 impl Default for Config {
@@ -54,13 +56,36 @@ impl Default for Config {
             copy_on_select: false,
             decorations: "client".into(),
             default_profile: None,
+            detect_shells: true,
             unfocused_pane_dim: 0.12,
             pane_headers: "auto".into(),
             bold_is_bright: false,
             profiles: Vec::new(),
             color_schemes: Vec::new(),
             keybindings: HashMap::new(),
+            locations: Vec::new(),
         }
+    }
+}
+
+/// A saved place to open a tab in: a local folder, or a folder on an SSH host.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct LocationDef {
+    pub name: String,
+    /// SSH host (as in `~/.ssh/config`); `None` or blank means a local folder.
+    pub host: Option<String>,
+    pub path: String,
+    /// Shortcut that opens it, e.g. `ctrl+alt+h`.
+    pub key: Option<String>,
+    /// Name of the profile to use (`ProfileDef.name`); the default profile when unset.
+    pub profile: Option<String>,
+    /// `#rrggbb`
+    pub tab_color: Option<String>,
+}
+
+impl LocationDef {
+    pub fn remote_host(&self) -> Option<&str> {
+        self.host.as_deref().map(str::trim).filter(|h| !h.is_empty())
     }
 }
 
@@ -163,24 +188,29 @@ impl Config {
             .unwrap_or_else(|| schemes[0].clone())
     }
 
-    /// Configured profiles, or shells detected from `/etc/shells` when none are configured.
+    /// Configured profiles, followed by any shells in `/etc/shells` they don't already cover
+    /// (unless `detect_shells = false`), so shells installed after the config was written show up.
     pub fn profiles(&self) -> Vec<Profile> {
-        if !self.profiles.is_empty() {
-            return self
-                .profiles
-                .iter()
-                .map(|p| Profile {
-                    name: p.name.clone(),
-                    command: expand_tilde(&p.command).to_string_lossy().into_owned(),
-                    args: p.args.clone(),
-                    cwd: p.cwd.as_deref().map(expand_tilde),
-                    scheme: p.color_scheme.clone(),
-                    tab_color: p.tab_color.as_deref().and_then(theme::hex),
-                    env: p.env.clone(),
-                })
-                .collect();
-        }
-        detect_shells()
+        let configured: Vec<Profile> = self
+            .profiles
+            .iter()
+            .map(|p| Profile {
+                name: p.name.clone(),
+                command: expand_tilde(&p.command).to_string_lossy().into_owned(),
+                args: p.args.clone(),
+                cwd: p.cwd.as_deref().map(expand_tilde),
+                scheme: p.color_scheme.clone(),
+                tab_color: p.tab_color.as_deref().and_then(theme::hex),
+                env: p.env.clone(),
+            })
+            .collect();
+        let detected = if self.detect_shells || configured.is_empty() {
+            detect_shells()
+        } else {
+            Vec::new()
+        };
+        let out = merge_detected(configured, detected);
+        if out.is_empty() { vec![fallback_shell()] } else { out }
     }
 
     pub fn default_profile_index(&self, profiles: &[Profile]) -> usize {
@@ -215,6 +245,18 @@ impl Config {
         for (combo, action) in &self.keybindings {
             add(combo, action);
         }
+        // Location shortcuts live with their location and win over any other use of the key.
+        for (i, loc) in self.locations.iter().enumerate() {
+            let Some(key) = loc.key.as_deref().filter(|k| !k.trim().is_empty()) else {
+                continue;
+            };
+            let Some(k) = KeyCombo::parse(key) else {
+                log::warn!("ignoring key {key:?} of location {:?}", loc.name);
+                continue;
+            };
+            map.retain(|(existing, _)| *existing != k);
+            map.push((k, Action::OpenLocation(i)));
+        }
         map
     }
 }
@@ -227,6 +269,74 @@ pub fn expand_tilde(p: &str) -> PathBuf {
         return dirs::home_dir().unwrap_or_default().join(rest);
     }
     PathBuf::from(p)
+}
+
+/// Quote `s` for a POSIX shell.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The `ssh` command for a tab on `host`, starting in `path` (the remote home when `None`).
+/// A leading `~` stays unquoted so the remote shell expands it.
+pub fn ssh_launch(host: &str, path: Option<&str>) -> (String, Vec<String>) {
+    let mut args = vec!["-t".to_string(), "--".to_string(), host.to_string()];
+    if let Some(path) = path.map(str::trim).filter(|p| !p.is_empty()) {
+        // `$SHELL` is expanded by the remote shell, giving the user's own login shell there.
+        args.push(format!("cd {} && exec $SHELL -l", remote_path_arg(path)));
+    }
+    ("ssh".to_string(), args)
+}
+
+/// `path` quoted for a remote shell, leaving a leading `~` unquoted so it expands.
+pub fn remote_path_arg(path: &str) -> String {
+    if path == "~" {
+        "~".to_string()
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        if rest.is_empty() {
+            "~/".to_string()
+        } else {
+            format!("~/{}", shell_quote(rest))
+        }
+    } else {
+        shell_quote(path)
+    }
+}
+
+/// Whether `host` is safe to hand to ssh as a host name (not an option, no spaces).
+pub fn valid_ssh_host(host: &str) -> bool {
+    !host.is_empty() && !host.starts_with('-') && !host.chars().any(char::is_whitespace)
+}
+
+/// Concrete host names from `~/.ssh/config`, in file order. Patterns (`*`, `?`, `!`) are skipped,
+/// and `Include`d files aren't read.
+pub fn ssh_hosts() -> Vec<String> {
+    let Some(path) = dirs::home_dir().map(|h| h.join(".ssh/config")) else {
+        return Vec::new();
+    };
+    parse_ssh_hosts(&std::fs::read_to_string(path).unwrap_or_default())
+}
+
+fn parse_ssh_hosts(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(keyword) = line.get(..4) else { continue };
+        let rest = &line[4..];
+        if !keyword.eq_ignore_ascii_case("host") || !rest.starts_with(|c: char| c.is_whitespace() || c == '=') {
+            continue;
+        }
+        let rest = rest.trim_start().trim_start_matches('=');
+        let rest = rest.split('#').next().unwrap_or("");
+        for name in rest.split_whitespace().map(|n| n.trim_matches('"')) {
+            if name.is_empty() || name.contains(['*', '?', '!']) || !valid_ssh_host(name) {
+                continue;
+            }
+            if !out.iter().any(|h| h == name) {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
 }
 
 fn detect_shells() -> Vec<Profile> {
@@ -264,18 +374,32 @@ fn detect_shells() -> Vec<Profile> {
             env: HashMap::new(),
         });
     }
-    if out.is_empty() {
-        out.push(Profile {
-            name: "Shell".into(),
-            command: login.unwrap_or_else(|| "/bin/sh".into()),
-            args: Vec::new(),
-            cwd: None,
-            scheme: None,
-            tab_color: None,
-            env: HashMap::new(),
-        });
-    }
     out
+}
+
+/// `$SHELL` (or `/bin/sh`), for when there are no profiles at all.
+fn fallback_shell() -> Profile {
+    Profile {
+        name: "Shell".into(),
+        command: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+        args: Vec::new(),
+        cwd: None,
+        scheme: None,
+        tab_color: None,
+        env: HashMap::new(),
+    }
+}
+
+/// Appends the detected shells whose program isn't already used by a configured profile.
+/// Programs are compared by file name, so `/bin/fish` covers a detected `/usr/bin/fish`.
+fn merge_detected(mut configured: Vec<Profile>, detected: Vec<Profile>) -> Vec<Profile> {
+    let base = |p: &Profile| Path::new(&p.command).file_name().map(|s| s.to_owned());
+    for d in detected {
+        if !configured.iter().any(|c| base(c) == base(&d)) {
+            configured.push(d);
+        }
+    }
+    configured
 }
 
 /// Everything a key binding or menu entry can trigger on the active tab/pane.
@@ -332,6 +456,8 @@ pub enum Action {
     ReloadConfig,
     NewTabMenu,
     Quit,
+    /// Open `[[locations]]` entry N. Bound through the location's own `key`, not `[keybindings]`.
+    OpenLocation(usize),
 }
 
 /// Every bindable action, grouped for the keybindings editor: (section, action, label).
@@ -403,6 +529,7 @@ impl Action {
         match self {
             NewTabProfile(i) => return format!("new_tab_profile_{}", i + 1),
             SwitchToTab(i) => return format!("switch_to_tab_{}", i + 1),
+            OpenLocation(i) => return format!("open_location_{}", i + 1),
             _ => {}
         }
         match self {
@@ -455,7 +582,7 @@ impl Action {
             ReloadConfig => "reload_config",
             NewTabMenu => "new_tab_menu",
             Quit => "quit",
-            NewTabProfile(_) | SwitchToTab(_) => unreachable!(),
+            NewTabProfile(_) | SwitchToTab(_) | OpenLocation(_) => unreachable!(),
         }
         .to_string()
     }
@@ -472,6 +599,9 @@ impl Action {
         }
         if let Some(n) = s.strip_prefix("switch_to_tab_") {
             return n.parse::<usize>().ok().filter(|n| *n >= 1).map(|n| SwitchToTab(n - 1));
+        }
+        if let Some(n) = s.strip_prefix("open_location_") {
+            return n.parse::<usize>().ok().filter(|n| *n >= 1).map(|n| OpenLocation(n - 1));
         }
         Some(match s.as_str() {
             "unbound" | "none" => Unbound,
@@ -718,7 +848,8 @@ impl KeyCombo {
     }
 }
 
-/// The `[keybindings]` entries needed to turn the defaults into `bindings`.
+/// The `[keybindings]` entries needed to turn the defaults into `bindings`. Location shortcuts
+/// are left out: they're saved with their location and re-applied over these on load.
 pub fn binding_overrides(bindings: &[(KeyCombo, Action)]) -> Vec<(String, String)> {
     let defaults = Config::default().keybindings();
     let mut out = Vec::new();
@@ -727,11 +858,15 @@ pub fn binding_overrides(bindings: &[(KeyCombo, Action)]) -> Vec<(String, String
             out.push((k.to_config(), "unbound".to_string()));
         } else if let Some((_, ba)) = bindings.iter().find(|(bk, _)| bk == k)
             && ba != a
+            && !matches!(ba, Action::OpenLocation(_))
         {
             out.push((k.to_config(), ba.name()));
         }
     }
     for (k, a) in bindings {
+        if matches!(a, Action::OpenLocation(_)) {
+            continue;
+        }
         if !defaults.iter().any(|(dk, _)| dk == k) {
             out.push((k.to_config(), a.name()));
         }
@@ -802,6 +937,38 @@ fn save_to(path: &Path, cfg: &Config, bindings: &[(KeyCombo, Action)]) -> anyhow
     }
     for (k, a) in overrides {
         table.insert(&k, toml_edit::value(a));
+    }
+
+    // Locations, with each one's shortcut taken from the live bindings.
+    let mut locations = cfg.locations.clone();
+    for (i, loc) in locations.iter_mut().enumerate() {
+        loc.key = bindings
+            .iter()
+            .find(|(_, a)| *a == Action::OpenLocation(i))
+            .map(|(k, _)| k.to_config());
+    }
+    if locations.is_empty() {
+        doc.remove("locations");
+    } else {
+        let mut tables = toml_edit::ArrayOfTables::new();
+        for loc in &locations {
+            let mut t = Table::new();
+            t.insert("name", toml_edit::value(loc.name.as_str()));
+            let optional = [
+                ("host", loc.remote_host()),
+                ("path", Some(loc.path.as_str())),
+                ("key", loc.key.as_deref()),
+                ("profile", loc.profile.as_deref()),
+                ("tab_color", loc.tab_color.as_deref()),
+            ];
+            for (k, v) in optional {
+                if let Some(v) = v {
+                    t.insert(k, toml_edit::value(v));
+                }
+            }
+            tables.push(t);
+        }
+        doc.insert("locations", Item::ArrayOfTables(tables));
     }
 
     let out = doc.to_string();
@@ -895,7 +1062,7 @@ fn write_default(path: &Path) -> std::io::Result<()> {
     }
     let mut text = DEFAULT_CONFIG.to_string();
     let shells = detect_shells();
-    text.push_str("\n# Shell profiles. Detected on first run; edit freely.\n");
+    text.push_str("\n# Shell profiles. Detected on first run; edit freely.\n# Shells installed later are added to the menu while detect_shells = true.\n");
     text.push_str("# Each profile appears in the new-tab (▾) menu.\n");
     for p in &shells {
         text.push_str(&format!(
@@ -940,6 +1107,8 @@ bold_is_bright = false
 decorations = "client"
 
 # default_profile = "Fish"
+# Also list shells from /etc/shells that no profile below uses, such as ones installed later.
+detect_shells = true
 
 # Keybindings override the defaults. Use "unbound" to remove one.
 # Actions: new_tab, new_tab_menu, new_tab_profile_N, duplicate_tab, close_tab, close_pane,
@@ -948,7 +1117,8 @@ decorations = "client"
 # toggle_pane_zoom, move_pane_to_new_tab, rename_pane, new_group, ungroup, toggle_group_collapse, copy, paste, select_all,
 # scroll_up/down, scroll_page_up/down, scroll_top/bottom, clear_scrollback,
 # font_bigger, font_smaller, font_reset, opacity_up, opacity_down, toggle_transparency,
-# next_color_scheme, toggle_fullscreen, open_settings, reload_config, quit
+# next_color_scheme, toggle_fullscreen, open_settings, reload_config, quit,
+# open_location_N (better set with the location's own `key`, see below)
 [keybindings]
 # "ctrl+shift+t" = "new_tab"
 # "alt+shift+equal" = "split_right"
@@ -977,6 +1147,16 @@ decorations = "client"
 # bright_magenta = "#e2c5ff"
 # bright_cyan = "#8de8ee"
 # bright_white = "#f5f7fa"
+
+# Locations: folders to open from the Locations menu in the tab bar, on this machine or over SSH.
+# Hosts from ~/.ssh/config are listed there automatically.
+# [[locations]]
+# name = "Web server"
+# host = "web1"              # an SSH host; leave out for a local folder
+# path = "~/sites/app"
+# key = "ctrl+alt+h"         # optional shortcut
+# profile = "Bash"           # optional profile name (default profile otherwise)
+# tab_color = "#6cb6ff"
 "##;
 
 #[cfg(test)]
@@ -986,11 +1166,35 @@ mod tests {
 
     #[test]
     fn default_config_file_parses() {
-        let mut text = DEFAULT_CONFIG.to_string();
+        let mut text = config_with_location_example();
         text.push_str("\n[[profiles]]\nname = \"Bash\"\ncommand = \"/bin/bash\"\n");
         let cfg: Config = toml::from_str(&text).expect("default config must parse");
         assert_eq!(cfg.font_family, Config::default().font_family);
         assert_eq!(cfg.profiles.len(), 1);
+        assert_eq!(cfg.locations.len(), 1);
+    }
+
+    fn shell(name: &str, command: &str) -> Profile {
+        Profile {
+            name: name.into(),
+            command: command.into(),
+            args: Vec::new(),
+            cwd: None,
+            scheme: None,
+            tab_color: None,
+            env: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn detected_shells_merge_after_configured() {
+        let configured = vec![shell("My Bash", "/bin/bash"), shell("Server", "/usr/bin/ssh")];
+        let detected = vec![shell("Bash", "/usr/bin/bash"), shell("Fish", "/usr/bin/fish")];
+        let names: Vec<_> = merge_detected(configured, detected)
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, ["My Bash", "Server", "Fish"]);
     }
 
     #[test]
@@ -1070,6 +1274,142 @@ mod tests {
             back.keybindings()
                 .contains(&(KeyCombo::parse("ctrl+t").unwrap(), Action::NewTab))
         );
+    }
+
+    /// DEFAULT_CONFIG with its `[[locations]]` example uncommented.
+    fn config_with_location_example() -> String {
+        let mut in_example = false;
+        DEFAULT_CONFIG
+            .lines()
+            .map(|l| {
+                if l == "# [[locations]]" {
+                    in_example = true;
+                }
+                if in_example && let Some(rest) = l.strip_prefix("# ") {
+                    return rest.to_string();
+                }
+                l.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn location_example_parses() {
+        let cfg: Config = toml::from_str(&config_with_location_example()).unwrap();
+        assert_eq!(
+            cfg.locations,
+            [LocationDef {
+                name: "Web server".into(),
+                host: Some("web1".into()),
+                path: "~/sites/app".into(),
+                key: Some("ctrl+alt+h".into()),
+                profile: Some("Bash".into()),
+                tab_color: Some("#6cb6ff".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn save_round_trips_locations() {
+        let path = std::env::temp_dir().join(format!("terminalgoblin-loc-test-{}.toml", std::process::id()));
+        std::fs::write(&path, DEFAULT_CONFIG).unwrap();
+        let mut cfg: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        cfg.locations = vec![
+            LocationDef {
+                name: "Home".into(),
+                path: "~/src".into(),
+                profile: Some("Fish".into()),
+                tab_color: Some("#7ee787".into()),
+                ..Default::default()
+            },
+            LocationDef {
+                name: "Web".into(),
+                host: Some("web1".into()),
+                path: "/var/www".into(),
+                ..Default::default()
+            },
+        ];
+        let mut b = cfg.keybindings();
+        b.push((KeyCombo::parse("ctrl+alt+w").unwrap(), Action::OpenLocation(1)));
+        let text = save_to(&path, &cfg, &b).unwrap();
+        std::fs::remove_file(&path).ok();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert!(
+            !back.keybindings.values().any(|a| a.starts_with("open_location")),
+            "location keys stay out of [keybindings]"
+        );
+        assert_eq!(back.locations[0], cfg.locations[0]);
+        assert_eq!(back.locations[1].key.as_deref(), Some("ctrl+alt+w"));
+        assert_eq!(back.locations[1].host.as_deref(), Some("web1"));
+        assert!(
+            back.keybindings()
+                .contains(&(KeyCombo::parse("ctrl+alt+w").unwrap(), Action::OpenLocation(1)))
+        );
+    }
+
+    #[test]
+    fn location_keys_bind_and_win() {
+        let cfg = Config {
+            locations: vec![
+                LocationDef {
+                    name: "a".into(),
+                    path: "/".into(),
+                    key: Some("ctrl+shift+t".into()),
+                    ..Default::default()
+                },
+                LocationDef {
+                    name: "b".into(),
+                    path: "/".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let b = cfg.keybindings();
+        let t = KeyCombo::parse("ctrl+shift+t").unwrap();
+        assert_eq!(
+            b.iter().filter(|(k, _)| *k == t).map(|(_, a)| *a).collect::<Vec<_>>(),
+            [Action::OpenLocation(0)]
+        );
+        assert!(!b.iter().any(|(_, a)| *a == Action::OpenLocation(1)));
+        // The default it displaced isn't written as an override, so it comes back if the key goes.
+        assert!(binding_overrides(&b).is_empty());
+    }
+
+    #[test]
+    fn open_location_names_round_trip() {
+        let a = Action::OpenLocation(2);
+        assert_eq!(a.name(), "open_location_3");
+        assert_eq!(Action::parse("open_location_3"), Some(a));
+        assert_eq!(Action::parse("open_location_0"), None);
+    }
+
+    #[test]
+    fn ssh_launch_quotes_paths() {
+        let args = |p: Option<&str>| ssh_launch("web1", p).1;
+        assert_eq!(args(None), ["-t", "--", "web1"]);
+        assert_eq!(args(Some("")), ["-t", "--", "web1"]);
+        assert_eq!(args(Some("/srv/my site"))[3], "cd '/srv/my site' && exec $SHELL -l");
+        assert_eq!(args(Some("/tmp/it's"))[3], "cd '/tmp/it'\\''s' && exec $SHELL -l");
+        assert_eq!(args(Some("~/a b"))[3], "cd ~/'a b' && exec $SHELL -l");
+        assert_eq!(args(Some("~"))[3], "cd ~ && exec $SHELL -l");
+        assert_eq!(ssh_launch("web1", None).0, "ssh");
+    }
+
+    #[test]
+    fn ssh_config_hosts() {
+        let text = "Host *\n  User me\nHost web1 web2 # comment\n  HostName 10.0.0.1\n\
+                    host=db\nHost !bastion jump\nHost web1\nMatch host x\nHost dev?\n";
+        assert_eq!(parse_ssh_hosts(text), ["web1", "web2", "db", "jump"]);
+    }
+
+    #[test]
+    fn ssh_host_validation() {
+        assert!(valid_ssh_host("user@web1"));
+        assert!(!valid_ssh_host("-oProxyCommand=touch /tmp/x"));
+        assert!(!valid_ssh_host(""));
+        assert!(!valid_ssh_host("a b"));
     }
 
     #[test]

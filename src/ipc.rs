@@ -57,6 +57,8 @@ pub struct LaunchSpec {
     pub kind: Option<String>,
     /// Bring the window to the front. Defaults to true.
     pub focus: Option<bool>,
+    /// Open the saved `[[locations]]` entry with this name; the other fields are ignored.
+    pub location: Option<String>,
 }
 
 impl LaunchSpec {
@@ -69,6 +71,7 @@ impl LaunchSpec {
             && self.group.is_none()
             && self.profile.is_none()
             && self.kind.is_none()
+            && self.location.is_none()
     }
 }
 
@@ -243,7 +246,7 @@ Control running TerminalGoblin windows.
       JSON list of instances, their tabs and panes (with each pane's launch environment).
   terminalgoblin @ launch [--cwd DIR] [--title T] [--color #RRGGBB] [--env K=V]...
                           [--group NAME] [--profile NAME] [--type tab|split-right|split-down]
-                          [--no-focus] [-- COMMAND ARGS...]
+                          [--no-focus] [--location NAME] [-- COMMAND ARGS...]
       Open a tab (or split) in the most recently focused window, starting TerminalGoblin
       if it isn't running. A --title stays put even if the shell sets its own.
   terminalgoblin @ focus --match MATCH
@@ -277,6 +280,7 @@ pub fn parse_launch_flags(args: &[String]) -> Result<(LaunchSpec, Vec<String>), 
             "--group" => spec.group = Some(value(&mut i, a)?),
             "--profile" => spec.profile = Some(value(&mut i, a)?),
             "--type" => spec.kind = Some(value(&mut i, a)?),
+            "--location" => spec.location = Some(value(&mut i, a)?),
             "--no-focus" => spec.focus = Some(false),
             "--env" => {
                 let kv = value(&mut i, a)?;
@@ -412,6 +416,9 @@ mod tests {
         assert!(parse_launch_flags(&s(&["--env", "novalue"])).is_err());
         let (e, _) = parse_launch_flags(&s(&["-e", "htop"])).unwrap();
         assert_eq!(e.argv, s(&["htop"]));
+        let (l, _) = parse_launch_flags(&s(&["--location", "Web 1"])).unwrap();
+        assert_eq!(l.location.as_deref(), Some("Web 1"));
+        assert!(!l.is_empty());
     }
 
     #[test]

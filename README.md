@@ -10,6 +10,7 @@ A tabbed, splittable, GPU-rendered terminal for Linux/Wayland, inspired by Windo
 - **Tabs**: tabs live in the titlebar. You can rename them (double-click, `Ctrl+Shift+R`), give them colors, reorder them by dragging, duplicate them, and close them with a middle-click.
 - **Tab groups**: named, colored groups of tabs, like a browser's. Click a group's chip to collapse or expand it, and double-click it to rename it.
 - **Several tabs at once**: drag a tab down onto a pane (the half it will land in is highlighted) or choose "Show beside/below current tab" from its menu. Its terminal joins the current tab as a split and keeps the tab's name and color, shown in a slim header on each pane. "Move to new tab" (`Alt+Shift+N`) turns a pane back into a tab with that name and color.
+- **Locations**: the **Locations** button in the tab bar opens saved folders, on this machine or on an SSH host, each in a new tab with its own name, color, profile and optional shortcut. Hosts from `~/.ssh/config` are listed too, and open in their home folder. Add and edit locations on the settings window's **Locations** page, which can also browse for a folder, locally or over SSH. When installed with `install.sh`, saved locations also appear when you right-click TerminalGoblin in the app menu, dock or taskbar (or run `terminalgoblin --location NAME`).
 - **Splits**: split panes right or down, move focus between them with the keyboard, resize them by dragging the divider or with the keyboard, and zoom a pane to fill the tab.
 - **Settings window** (`Ctrl+,`): change colors, fonts, text size, opacity, blur, padding, pane headers, cursor and more, with every change applied live. The **Keybindings** page lets you click any shortcut and press new keys to rebind it, add or remove shortcuts, and reset one action or all of them. Everything is saved to the config file with its comments intact.
 - **Per-pane text size**: `Ctrl+=` / `Ctrl+-` / `Ctrl+Scroll` resize the text in a single pane; `Ctrl+0` resets it to the default.
@@ -93,7 +94,17 @@ tab_color = "#7ee787"
 [keybindings]
 "ctrl+t" = "new_tab"
 "ctrl+shift+t" = "unbound"
+
+[[locations]]
+name = "Web server"
+host = "web1"               # an SSH host (as in ~/.ssh/config); leave out for a local folder
+path = "~/sites/app"        # folder to start in; ~ means the home folder
+key = "ctrl+alt+h"          # optional shortcut; takes the key over from any other action
+profile = "Bash"            # optional profile name; the default profile otherwise
+tab_color = "#6cb6ff"       # optional
 ```
+
+An SSH location runs `ssh -t host "cd <path> && exec $SHELL -l"` in the tab, so splitting, duplicating and restarting (`r` after it disconnects) reconnect to the same folder. The folder browser connects with `ssh -o BatchMode=yes`, so it needs key or ssh-agent login: hosts that ask for a password or a second factor can't be browsed, but you can still type their folder. Hosts are read from `~/.ssh/config` only, not from files it `Include`s, and wildcard `Host` patterns are skipped.
 
 See the generated file for every option, every action name, and a template for custom color schemes.
 

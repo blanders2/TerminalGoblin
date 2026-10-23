@@ -31,6 +31,102 @@ pub enum UserEvent {
     Term(PaneId, Event),
     ConfigChanged,
     Ipc(crate::ipc::Request),
+    /// A remote folder listing for the settings folder browser: (canonical dir, subfolders).
+    RemoteDir {
+        req: u64,
+        result: Result<(String, Vec<String>), String>,
+    },
+}
+
+/// List the subfolders of `dir` on `host` over ssh in the background, sending a
+/// [`UserEvent::RemoteDir`] when done. Key/agent auth only (`BatchMode`), with an overall deadline.
+pub fn list_remote_dir(proxy: EventLoopProxy<UserEvent>, req: u64, host: String, dir: String) {
+    let send = move |result| {
+        let _ = proxy.send_event(UserEvent::RemoteDir { req, result });
+    };
+    if !crate::config::valid_ssh_host(&host) {
+        send(Err(format!("invalid host {host:?}")));
+        return;
+    }
+    std::thread::Builder::new()
+        .name("remote dir".into())
+        .spawn(move || send(run_remote_ls(&host, &dir)))
+        .ok();
+}
+
+fn run_remote_ls(host: &str, dir: &str) -> Result<(String, Vec<String>), String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let dir = crate::config::remote_path_arg(if dir.trim().is_empty() { "~" } else { dir.trim() });
+    let mut child = Command::new("ssh")
+        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", host])
+        .arg(format!("cd {dir} && pwd && ls -1Ap"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("could not run ssh: {e}"))?;
+    // Read both pipes on their own threads so a chatty child can't block on a full pipe.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_string(&mut buf);
+            }
+            buf
+        })
+    };
+    let out = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let err = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("timed out connecting to {host}"));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+    let stdout = out.join().unwrap_or_default();
+    let stderr = err.join().unwrap_or_default();
+    if !status.success() {
+        let msg = stderr.trim();
+        return Err(if msg.is_empty() {
+            format!("ssh {status}")
+        } else {
+            msg.to_string()
+        });
+    }
+    Ok(parse_remote_ls(&stdout))
+}
+
+/// `pwd` followed by `ls -1Ap` output: the folder and its sorted subfolders.
+fn parse_remote_ls(out: &str) -> (String, Vec<String>) {
+    let mut lines = out.lines();
+    let cwd = lines.next().unwrap_or("").trim().to_string();
+    let mut dirs: Vec<String> = lines
+        .filter_map(|l| l.strip_suffix('/'))
+        .filter(|d| !d.is_empty())
+        .map(str::to_string)
+        .collect();
+    dirs.sort_by_key(|d| d.to_lowercase());
+    (cwd, dirs)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn remote_listing_keeps_folders() {
+        let (cwd, dirs) = super::parse_remote_ls("/home/me\n.config/\nb.txt\nZed/\napp/\n");
+        assert_eq!(cwd, "/home/me");
+        assert_eq!(dirs, [".config", "app", "Zed"]);
+    }
 }
 
 #[derive(Clone)]

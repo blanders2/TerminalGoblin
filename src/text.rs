@@ -427,6 +427,25 @@ impl TextSystem {
         }
         chars[..lo].iter().collect::<String>().trim_end().to_string() + "…"
     }
+
+    /// Like [`Self::ellipsize`], but keeps the end of the text (for paths).
+    pub fn ellipsize_start(&mut self, text: &str, size: f32, bold: bool, max_w: f32) -> String {
+        if self.measure(text, size, bold) <= max_w {
+            return text.to_string();
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let (mut lo, mut hi) = (0usize, chars.len());
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            let candidate: String = "…".to_string() + &chars[chars.len() - mid..].iter().collect::<String>();
+            if self.measure(&candidate, size, bold) <= max_w {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        "…".to_string() + &chars[chars.len() - lo..].iter().collect::<String>()
+    }
 }
 
 /// Box-drawing line weights (up, right, down, left): 0 none, 1 light, 2 heavy, 3 double.

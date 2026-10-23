@@ -57,6 +57,7 @@ pub struct App {
 impl App {
     pub fn new(proxy: EventLoopProxy<UserEvent>, opts: Options) -> App {
         let (cfg, startup_error) = Config::load();
+        crate::desktop::sync_actions(&cfg.locations);
         App {
             proxy,
             cfg,
@@ -97,8 +98,8 @@ pub struct State {
     pub schemes: Vec<Scheme>,
     pub scheme: Scheme,
     pub ui: UiPalette,
-    proxy: EventLoopProxy<UserEvent>,
-    clipboard: Option<Clipboard>,
+    pub(crate) proxy: EventLoopProxy<UserEvent>,
+    pub(crate) clipboard: Option<Clipboard>,
     pub scale: f32,
     pub size: PhysicalSize<u32>,
     pub mods: ModifiersState,
@@ -191,6 +192,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let reply = st.handle_ipc(req.body);
                 let _ = req.reply.send(reply);
             }
+            UserEvent::RemoteDir { req, result } => st.remote_dir_listed(req, result),
         }
         if st.exit {
             event_loop.exit();
@@ -642,22 +644,91 @@ impl State {
     }
 
     pub fn new_tab(&mut self, profile: usize, cwd: Option<PathBuf>) -> anyhow::Result<()> {
+        self.open_tab_with(profile, cwd, PaneLaunch::default(), None, None)
+            .map(|_| ())
+    }
+
+    /// Open a tab after the active one and switch to it. The color defaults to the profile's.
+    pub(crate) fn open_tab_with(
+        &mut self,
+        profile: usize,
+        cwd: Option<PathBuf>,
+        launch: PaneLaunch,
+        title: Option<String>,
+        color: Option<theme::Color>,
+    ) -> anyhow::Result<(TabId, PaneId)> {
         let area = self.content_rect();
-        let pane = self.spawn_pane(profile, cwd, area, None, PaneLaunch::default())?;
+        let pane = self.spawn_pane(profile, cwd, area, None, launch)?;
         let tab_id = self.ws.next_id();
-        let color = self.profiles.get(profile).and_then(|p| p.tab_color);
+        let color = color.or_else(|| self.profiles.get(profile).and_then(|p| p.tab_color));
         self.ws.insert_tab(Tab {
             id: tab_id,
             root: Node::Leaf(pane),
             focused: pane,
-            custom_title: None,
+            custom_title: title,
             color,
             group: None,
             zoomed: false,
             bell: false,
         });
         self.after_structure_change();
-        Ok(())
+        Ok((tab_id, pane))
+    }
+
+    /// Open saved location `i` in a new tab: a local folder, or an ssh session in a remote one.
+    pub(crate) fn open_location(&mut self, i: usize) {
+        if let Err(e) = self.try_open_location(i) {
+            self.show_toast(e);
+        }
+    }
+
+    pub(crate) fn try_open_location(&mut self, i: usize) -> Result<(TabId, PaneId), String> {
+        let loc = self.cfg.locations.get(i).cloned().ok_or("no such location")?;
+        let mut profile = self.cfg.default_profile_index(&self.profiles);
+        if let Some(name) = loc.profile.as_deref().filter(|n| !n.trim().is_empty()) {
+            match self.profiles.iter().position(|p| p.name.eq_ignore_ascii_case(name)) {
+                Some(p) => profile = p,
+                None => self.show_toast(format!("Profile \"{name}\" not found; using the default")),
+            }
+        }
+        let color = loc.tab_color.as_deref().and_then(theme::hex);
+        let title = Some(loc.name.clone()).filter(|n| !n.trim().is_empty());
+        let result = match loc.remote_host() {
+            Some(host) => {
+                if !config::valid_ssh_host(host) {
+                    return Err(format!("Invalid SSH host \"{host}\""));
+                }
+                let launch = PaneLaunch {
+                    command: Some(config::ssh_launch(host, Some(&loc.path))),
+                    ..Default::default()
+                };
+                self.open_tab_with(profile, None, launch, title, color)
+            }
+            None => {
+                let dir = config::expand_tilde(loc.path.trim());
+                if !dir.is_dir() {
+                    return Err(format!("Folder not found: {}", dir.display()));
+                }
+                self.open_tab_with(profile, Some(dir), PaneLaunch::default(), title, color)
+            }
+        };
+        result.map_err(|e| format!("Could not open {}: {e}", loc.name))
+    }
+
+    /// Open a new tab with `ssh host`, in the remote home folder.
+    pub(crate) fn open_ssh_host(&mut self, host: &str) {
+        if !config::valid_ssh_host(host) {
+            self.show_toast(format!("Invalid SSH host \"{host}\""));
+            return;
+        }
+        let profile = self.cfg.default_profile_index(&self.profiles);
+        let launch = PaneLaunch {
+            command: Some(config::ssh_launch(host, None)),
+            ..Default::default()
+        };
+        if let Err(e) = self.open_tab_with(profile, None, launch, Some(host.to_string()), None) {
+            self.show_toast(format!("Could not open {host}: {e}"));
+        }
     }
 
     pub(crate) fn new_tab_or_toast(&mut self, profile: usize, cwd: Option<PathBuf>) {
@@ -868,6 +939,7 @@ impl State {
                     p.label = (!text.is_empty()).then_some(text);
                 }
             }
+            EditTarget::Field => {}
         }
         self.update_window_title();
         self.window.request_redraw();
@@ -1093,6 +1165,7 @@ impl State {
                 self.open_new_tab_menu(r.x, r.bottom() + 4.0 * s);
             }
             Action::Quit => self.exit = true,
+            Action::OpenLocation(i) => self.open_location(i),
         }
     }
 
@@ -1288,6 +1361,13 @@ impl State {
                 self.ui = UiPalette::from_scheme(&self.scheme);
                 self.show_toast(format!("Color scheme: {name}"));
             }
+            Cmd::OpenLocation(i) => self.open_location(i),
+            Cmd::OpenSshHost(host) => self.open_ssh_host(&host),
+            Cmd::ManageLocations => self.open_settings_page(crate::settings::Page::Locations),
+            Cmd::AddLocation => {
+                self.open_settings_page(crate::settings::Page::Locations);
+                self.edit_location(None);
+            }
         }
         self.after_structure_change();
     }
@@ -1401,6 +1481,7 @@ impl State {
         for p in self.ws.panes.values() {
             p.term.lock().set_options(tc.clone());
         }
+        crate::desktop::sync_actions(&cfg.locations);
         self.cfg = cfg;
         if font_changed {
             self.font_size = self.cfg.font_size;
@@ -1489,6 +1570,42 @@ impl State {
             self.hint(Action::ReloadConfig),
             Cmd::Action(Action::ReloadConfig),
         ));
+        self.open_menu(entries, x, y);
+    }
+
+    pub(crate) fn open_locations_menu(&mut self, x: f32, y: f32) {
+        let mut entries = vec![MenuEntry::Label("Locations".into())];
+        if self.cfg.locations.is_empty() {
+            entries.push(MenuEntry::Label("No locations yet".into()));
+        }
+        for (i, loc) in self.cfg.locations.iter().enumerate() {
+            let hint = self.hint(Action::OpenLocation(i));
+            // The host goes in the dimmed hint column, before any shortcut.
+            let hint = match (loc.remote_host(), hint.is_empty()) {
+                (Some(h), true) => h.to_string(),
+                (Some(h), false) => format!("{h}  ·  {hint}"),
+                (None, _) => hint,
+            };
+            entries.push(MenuEntry::item(&loc.name, hint, Cmd::OpenLocation(i)));
+        }
+        // Hosts from ~/.ssh/config, read fresh each time, minus those saved for their home folder.
+        let saved_home = |h: &str| {
+            self.cfg
+                .locations
+                .iter()
+                .any(|l| l.remote_host() == Some(h) && matches!(l.path.trim(), "" | "~" | "~/"))
+        };
+        let hosts: Vec<String> = config::ssh_hosts().into_iter().filter(|h| !saved_home(h)).collect();
+        if !hosts.is_empty() {
+            entries.push(MenuEntry::Separator);
+            entries.push(MenuEntry::Label("SSH hosts".into()));
+            for h in hosts {
+                entries.push(MenuEntry::item(&h, "", Cmd::OpenSshHost(h.clone())));
+            }
+        }
+        entries.push(MenuEntry::Separator);
+        entries.push(MenuEntry::item("Add location…", "", Cmd::AddLocation));
+        entries.push(MenuEntry::item("Edit locations…", "", Cmd::ManageLocations));
         self.open_menu(entries, x, y);
     }
 
@@ -1706,7 +1823,9 @@ impl State {
                 }
             }
             WindowEvent::Ime(Ime::Commit(text)) => {
-                if let Some(edit) = self.edit.as_mut() {
+                if self.settings_text(&text) {
+                    self.window.request_redraw();
+                } else if let Some(edit) = self.edit.as_mut() {
                     edit.insert(&text);
                     self.window.request_redraw();
                 } else if let Some(p) = self.ws.focused_pane() {
@@ -1874,7 +1993,7 @@ impl State {
             return;
         }
 
-        if self.settings_key(key, unmodified, self.mods) {
+        if self.settings_key(key, unmodified, text, self.mods) {
             return;
         }
 
@@ -2196,7 +2315,7 @@ impl State {
                     .iter()
                     .find(|(id, _)| *id == p)
                     .and_then(|(_, r)| self.pane_header(*r)),
-                None => None,
+                Some(EditTarget::Field) | None => None,
             };
             if editing_rect.is_some_and(|r| r.contains(x, y)) {
                 return;
@@ -2254,6 +2373,10 @@ impl State {
                 (Some(Hit::NewTab), MouseButton::Right) | (Some(Hit::NewTabMenu), _) => {
                     let r = bar.dropdown;
                     self.open_new_tab_menu(r.x, r.bottom() + 4.0 * s);
+                }
+                (Some(Hit::Locations), MouseButton::Left) => {
+                    let r = bar.locations;
+                    self.open_locations_menu(r.x, r.bottom() + 4.0 * s);
                 }
                 (Some(Hit::Minimize), MouseButton::Left) => self.window.set_minimized(true),
                 (Some(Hit::Maximize), MouseButton::Left) => self.window.set_maximized(!self.window.is_maximized()),

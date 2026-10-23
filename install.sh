@@ -14,7 +14,11 @@ command -v cargo >/dev/null || { echo "cargo not found; install Rust via https:/
 
 cargo build --release
 install -Dm755 target/release/terminalgoblin "$PREFIX/bin/terminalgoblin"
-install -Dm644 assets/terminalgoblin.desktop "$PREFIX/share/applications/terminalgoblin.desktop"
+# Use an absolute Exec path: desktop sessions (e.g. KDE) often don't have $PREFIX/bin on PATH.
+install -d "$PREFIX/share/applications"
+sed "s|^Exec=terminalgoblin|Exec=$PREFIX/bin/terminalgoblin|" assets/terminalgoblin.desktop \
+    > "$PREFIX/share/applications/terminalgoblin.desktop"
+chmod 644 "$PREFIX/share/applications/terminalgoblin.desktop"
 install -Dm644 assets/terminalgoblin.svg "$PREFIX/share/icons/hicolor/scalable/apps/terminalgoblin.svg"
 command -v update-desktop-database >/dev/null && update-desktop-database "$PREFIX/share/applications" || true
 

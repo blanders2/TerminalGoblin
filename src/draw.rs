@@ -364,6 +364,24 @@ impl State {
         ));
         self.draw_chevron(out, bar.dropdown, if dd_hover { ui.text } else { ui.text_dim });
 
+        // Locations button.
+        let loc_hover = hover == Some(Hit::Locations);
+        if loc_hover {
+            out.push(Instance::rounded(bar.locations, ui.hover, 7.0 * s));
+        }
+        let font = ui::UI_FONT * s;
+        let lw = self.text.measure(ui::LOCATIONS_LABEL, font, false);
+        self.text.draw_ui(
+            out,
+            ui::LOCATIONS_LABEL,
+            (bar.locations.x + (bar.locations.w - lw) / 2.0).round(),
+            bar.locations.center_y(),
+            font,
+            false,
+            if loc_hover { ui.text } else { ui.text_dim },
+            bar.locations,
+        );
+
         // Window controls.
         if let Some([min, max, close]) = bar.controls {
             let col = |h: bool| if h { ui.text } else { ui.text_dim };

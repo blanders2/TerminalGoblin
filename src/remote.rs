@@ -9,7 +9,6 @@ use crate::ipc::LaunchSpec;
 use crate::layout::{Axis, Node};
 use crate::pane::{PaneId, PaneLaunch};
 use crate::theme::{self, Color};
-use crate::workspace::Tab;
 
 fn color_json(c: Option<Color>) -> Value {
     c.map(|c| {
@@ -219,6 +218,22 @@ impl State {
 
     /// Open a tab (or split) described by `spec`.
     pub(crate) fn launch(&mut self, spec: LaunchSpec) -> Result<Value, String> {
+        if let Some(name) = spec.location.as_deref().map(str::trim) {
+            let i = self
+                .cfg
+                .locations
+                .iter()
+                .position(|l| l.name.trim().eq_ignore_ascii_case(name))
+                .ok_or_else(|| format!("no location named {name:?}"))?;
+            let (tab_id, pane) = self.try_open_location(i)?;
+            self.after_structure_change();
+            if spec.focus != Some(false) {
+                self.raise_window();
+            }
+            return Ok(
+                json!({"ok": true, "found": true, "tab_id": tab_id, "pane_id": pane, "pid": std::process::id()}),
+            );
+        }
         let profile = match &spec.profile {
             Some(name) => self
                 .profiles
@@ -274,21 +289,10 @@ impl State {
                 (tab.id, pane)
             }
             _ => {
-                let area = self.content_rect();
-                let pane = self
-                    .spawn_pane(profile, cwd, area, None, launch)
+                let (id, pane) = self
+                    .open_tab_with(profile, cwd, launch, title, color)
                     .map_err(|e| e.to_string())?;
-                let id = self.ws.next_id();
-                let index = self.ws.insert_tab(Tab {
-                    id,
-                    root: Node::Leaf(pane),
-                    focused: pane,
-                    custom_title: title,
-                    color: color.or_else(|| self.profiles.get(profile).and_then(|p| p.tab_color)),
-                    group: None,
-                    zoomed: false,
-                    bell: false,
-                });
+                let index = self.ws.active;
                 match spec.group.as_deref().map(str::trim).filter(|g| !g.is_empty()) {
                     Some(name) => {
                         let existing = self
