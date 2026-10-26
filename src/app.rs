@@ -10,17 +10,17 @@ use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::{ClipboardType, TermMode};
 use alacritty_terminal::vte::ansi::Rgb;
-use raw_window_handle::{HasDisplayHandle, RawDisplayHandle};
-use smithay_clipboard::Clipboard;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+#[cfg(not(windows))]
 use winit::platform::wayland::WindowAttributesExtWayland;
 use winit::window::{CursorIcon, Fullscreen, ResizeDirection, UserAttentionType, Window, WindowId};
 
+use crate::clipboard::Clipboard;
 use crate::config::{self, Action, Config, KeyCombo, Profile};
 use crate::input::{self, MouseButtonCode};
 use crate::layout::{self, Axis, Dir, Divider, Node};
@@ -267,22 +267,20 @@ impl State {
     ) -> anyhow::Result<State> {
         let attrs = Window::default_attributes()
             .with_title("TerminalGoblin")
-            .with_name("terminalgoblin", "terminalgoblin")
             .with_transparent(true)
             .with_blur(cfg.blur)
             .with_decorations(!cfg.client_decorations())
             .with_inner_size(LogicalSize::new(1060.0, 680.0))
             .with_min_inner_size(LogicalSize::new(380.0, 220.0));
+        #[cfg(not(windows))]
+        let attrs = attrs.with_name("terminalgoblin", "terminalgoblin");
         let window = Arc::new(event_loop.create_window(attrs)?);
         window.set_ime_allowed(true);
         let renderer = Renderer::new(window.clone())?;
         let scale = window.scale_factor() as f32;
         let text = TextSystem::new(&cfg.font_family, &cfg.ui_font_family, cfg.line_height);
 
-        let clipboard = match window.display_handle().map(|h| h.as_raw()) {
-            Ok(RawDisplayHandle::Wayland(h)) => Some(unsafe { Clipboard::new(h.display.as_ptr()) }),
-            _ => None,
-        };
+        let clipboard = Clipboard::new(&window);
 
         let schemes = cfg.schemes();
         let scheme = cfg.scheme(None);
@@ -1374,7 +1372,7 @@ impl State {
 
     pub(crate) fn open_config_file(&mut self) {
         let path = config::config_path();
-        if let Err(e) = std::process::Command::new("xdg-open").arg(&path).spawn() {
+        if let Err(e) = open_external(path.as_os_str()) {
             self.show_toast(format!("Could not open {}: {e}", path.display()));
         }
     }
@@ -2457,7 +2455,7 @@ impl State {
                     .get(&pane)
                     .and_then(|p| p.term.lock().grid()[point].hyperlink().map(|h| h.uri().to_string()));
                 if let Some(uri) = uri
-                    && let Err(e) = std::process::Command::new("xdg-open").arg(&uri).spawn()
+                    && let Err(e) = open_link(&uri)
                 {
                     self.show_toast(format!("Could not open link: {e}"));
                 }
@@ -2649,6 +2647,39 @@ impl State {
             self.window.request_redraw();
         }
     }
+}
+
+/// Open a file or URL with the desktop's default application.
+#[cfg(not(windows))]
+fn open_external(target: &std::ffi::OsStr) -> std::io::Result<()> {
+    std::process::Command::new("xdg-open").arg(target).spawn().map(drop)
+}
+
+/// Open a file or URL with the desktop's default application.
+#[cfg(windows)]
+fn open_external(target: &std::ffi::OsStr) -> std::io::Result<()> {
+    std::process::Command::new("rundll32")
+        .arg("url.dll,FileProtocolHandler")
+        .arg(target)
+        .spawn()
+        .map(drop)
+}
+
+/// Open a hyperlink a program printed.
+#[cfg(not(windows))]
+fn open_link(uri: &str) -> std::io::Result<()> {
+    open_external(uri.as_ref())
+}
+
+/// Open a hyperlink a program printed. Windows would also run a program given its path, so only
+/// web and mail links are opened.
+#[cfg(windows)]
+fn open_link(uri: &str) -> std::io::Result<()> {
+    let lower = uri.to_ascii_lowercase();
+    if !["http://", "https://", "mailto:"].iter().any(|s| lower.starts_with(s)) {
+        return Err(std::io::Error::other("only web and mail links can be opened"));
+    }
+    open_external(uri.as_ref())
 }
 
 fn unix_now() -> f64 {

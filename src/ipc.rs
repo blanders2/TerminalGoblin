@@ -1,12 +1,13 @@
 //! Remote control: a Unix socket per running instance, and the `terminalgoblin @ ...` client.
 //!
-//! Each instance listens on `$XDG_RUNTIME_DIR/terminalgoblin/<pid>.sock`. A request is one line
+//! Each instance listens on `$XDG_RUNTIME_DIR/terminalgoblin/<pid>.sock` (on Windows, which has
+//! Unix sockets too, `%TEMP%\terminalgoblin\<pid>.sock`). A request is one line
 //! of JSON (`{"cmd": "ls"}`, `{"cmd": "launch", ...}`, ...) and the reply is one line of JSON.
 //! This is what lets tools like PatchGoblin open named, colored tabs and find them again.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+#[cfg(not(windows))]
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -15,6 +16,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(windows)]
+use uds_windows::{UnixListener, UnixStream};
 use winit::event_loop::EventLoopProxy;
 
 use crate::pane::UserEvent;
@@ -91,7 +94,11 @@ pub fn socket_path() -> Option<&'static Path> {
 pub fn serve(proxy: EventLoopProxy<UserEvent>) -> std::io::Result<PathBuf> {
     let dir = socket_dir();
     std::fs::create_dir_all(&dir)?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     let path = dir.join(format!("{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
@@ -192,13 +199,13 @@ pub fn forward_launch(spec: &LaunchSpec) -> Option<Value> {
 
 /// Start a new instance whose first tab is `spec`, and wait until it answers.
 fn start_instance(spec: &LaunchSpec) -> Result<Value, String> {
-    use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let before: Vec<PathBuf> = instances();
     let json = serde_json::to_string(spec).map_err(|e| e.to_string())?;
     let mut command = std::process::Command::new(exe);
     // Started from a background service (e.g. PatchGoblin under systemd), the session's display
     // may not be in our environment: find the compositor's socket ourselves.
+    #[cfg(not(windows))]
     if std::env::var_os("WAYLAND_DISPLAY").is_none()
         && let Some(display) = find_wayland_display()
     {
@@ -208,8 +215,20 @@ fn start_instance(spec: &LaunchSpec) -> Result<Value, String> {
         .args(["--new-instance", "--launch-json", &json])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .process_group(0)
+        .stderr(std::process::Stdio::null());
+    // Detach, so the new window outlives this client.
+    #[cfg(not(windows))]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    #[cfg(windows)]
+    {
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        std::os::windows::process::CommandExt::creation_flags(
+            &mut command,
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+        );
+    }
+    command
         .spawn()
         .map_err(|e| format!("could not start TerminalGoblin: {e}"))?;
     for _ in 0..50 {
@@ -225,6 +244,7 @@ fn start_instance(spec: &LaunchSpec) -> Result<Value, String> {
 }
 
 /// The first `wayland-N` socket in the runtime directory.
+#[cfg(not(windows))]
 fn find_wayland_display() -> Option<String> {
     use std::os::unix::fs::FileTypeExt;
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;

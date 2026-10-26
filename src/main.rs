@@ -1,9 +1,13 @@
-//! TerminalGoblin: a tabbed, splittable GPU terminal for Wayland.
+//! TerminalGoblin: a tabbed, splittable GPU terminal for Wayland (and Windows).
 
 // Drawing helpers take positions, colors and clips explicitly.
 #![allow(clippy::too_many_arguments)]
+// A GUI program on Windows, so starting it doesn't open a console window. Debug builds keep the
+// console for their log.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
+mod clipboard;
 mod config;
 mod desktop;
 mod draw;
@@ -41,6 +45,14 @@ that's already running (if there is one) instead of a new window.
 ";
 
 fn main() -> anyhow::Result<()> {
+    // Windows GUI programs aren't attached to the console they're started from: attach, so
+    // `terminalgoblin @ ...`, --help and errors print there. Does nothing without one.
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("terminalgoblin=info,wgpu=error,naga=error"),
     )
@@ -93,6 +105,12 @@ fn main() -> anyhow::Result<()> {
 
     // TERM / COLORTERM for child shells.
     alacritty_terminal::tty::setup_env();
+
+    // Let go of that console now, so closing it doesn't close the window too.
+    #[cfg(all(windows, not(debug_assertions)))]
+    unsafe {
+        windows_sys::Win32::System::Console::FreeConsole();
+    }
 
     let event_loop = EventLoop::with_user_event().build()?;
     let mut app = app::App::new(event_loop.create_proxy(), opts);

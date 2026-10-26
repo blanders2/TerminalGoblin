@@ -36,6 +36,10 @@ Or just run it from the checkout:
 cargo run --release
 ```
 
+### Windows (experimental)
+
+`cargo build --release` builds `target\release\terminalgoblin.exe`. It detects PowerShell, Windows PowerShell, Command Prompt and Git Bash, and keeps its config in `%APPDATA%\terminalgoblin\config.toml`. Not yet supported: transparency and blur, saved locations in the taskbar's right-click menu, and opening splits in the shell's current folder. The primary selection (middle-click paste) works only within TerminalGoblin.
+
 ## Keybindings
 
 | Action | Keys |

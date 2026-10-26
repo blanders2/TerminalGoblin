@@ -16,11 +16,19 @@ pollster = "1.0.1"
 raw-window-handle = "0.6.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-smithay-clipboard = "0.7.3"
 toml = "1.1.8"
 toml_edit = "0.25.17"
 wgpu = "30.0.1"
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+
+[target.'cfg(not(windows))'.dependencies]
+smithay-clipboard = "0.7.3"
 winit = { version = "0.30", default-features = false, features = ["wayland", "wayland-dlopen", "wayland-csd-adwaita", "rwh_06"] }
+
+[target.'cfg(windows)'.dependencies]
+arboard = { version = "3.7.0", default-features = false }
+uds_windows = "1.2.1"
+windows-sys = { version = "0.59.0", features = ["Win32_System_Console"] }
 
 [profile.dev.package."*"]
 opt-level = 2

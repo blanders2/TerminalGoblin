@@ -39,12 +39,10 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            // cosmic-term's default font, which is what Claude Code renders in on COSMIC.
-            font_family: "Noto Sans Mono".into(),
+            font_family: DEFAULT_FONT.into(),
             font_size: 14.0,
             line_height: 1.0,
-            // COSMIC's interface font.
-            ui_font_family: "Open Sans".into(),
+            ui_font_family: DEFAULT_UI_FONT.into(),
             color_scheme: "Goblin".into(),
             opacity: 0.94,
             tab_bar_opacity: None,
@@ -112,6 +110,17 @@ pub struct Profile {
     pub tab_color: Option<theme::Color>,
     pub env: HashMap<String, String>,
 }
+
+// cosmic-term's default font, which is what Claude Code renders in on COSMIC, and COSMIC's
+// interface font. On Windows, Windows Terminal's fonts.
+#[cfg(not(windows))]
+const DEFAULT_FONT: &str = "Noto Sans Mono";
+#[cfg(not(windows))]
+const DEFAULT_UI_FONT: &str = "Open Sans";
+#[cfg(windows)]
+const DEFAULT_FONT: &str = "Cascadia Mono";
+#[cfg(windows)]
+const DEFAULT_UI_FONT: &str = "Segoe UI";
 
 pub fn config_dir() -> PathBuf {
     dirs::config_dir()
@@ -339,6 +348,7 @@ fn parse_ssh_hosts(text: &str) -> Vec<String> {
     out
 }
 
+#[cfg(not(windows))]
 fn detect_shells() -> Vec<Profile> {
     const SKIP: &[&str] = &["sh", "dash", "rbash", "git-shell", "nologin", "false", "screen", "tmux"];
     let mut seen: Vec<String> = Vec::new();
@@ -377,11 +387,58 @@ fn detect_shells() -> Vec<Profile> {
     out
 }
 
-/// `$SHELL` (or `/bin/sh`), for when there are no profiles at all.
+/// PowerShell 7, Windows PowerShell, Command Prompt and Git Bash, whichever are installed.
+#[cfg(windows)]
+fn detect_shells() -> Vec<Profile> {
+    let env_dir =
+        |var: &str, default: &str| std::env::var_os(var).map_or_else(|| PathBuf::from(default), PathBuf::from);
+    let system = env_dir("SystemRoot", r"C:\Windows").join("System32");
+    let program_files = env_dir("ProgramFiles", r"C:\Program Files");
+    let pwsh = std::env::var_os("PATH")
+        .and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|d| d.join("pwsh.exe"))
+                .find(|p| p.exists())
+        })
+        .unwrap_or_else(|| program_files.join(r"PowerShell\7\pwsh.exe"));
+    let candidates = [
+        ("PowerShell", pwsh, &["-NoLogo"][..]),
+        (
+            "Windows PowerShell",
+            system.join(r"WindowsPowerShell\v1.0\powershell.exe"),
+            &["-NoLogo"][..],
+        ),
+        ("Command Prompt", system.join("cmd.exe"), &[][..]),
+        (
+            "Git Bash",
+            program_files.join(r"Git\bin\bash.exe"),
+            &["--login", "-i"][..],
+        ),
+    ];
+    candidates
+        .into_iter()
+        .filter(|(_, path, _)| path.exists())
+        .map(|(name, path, args)| Profile {
+            name: name.into(),
+            command: path.to_string_lossy().into_owned(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            cwd: None,
+            scheme: None,
+            tab_color: None,
+            env: HashMap::new(),
+        })
+        .collect()
+}
+
+/// `$SHELL` (or `/bin/sh`; `%COMSPEC%` on Windows), for when there are no profiles at all.
 fn fallback_shell() -> Profile {
+    #[cfg(not(windows))]
+    let command = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    #[cfg(windows)]
+    let command = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
     Profile {
         name: "Shell".into(),
-        command: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+        command,
         args: Vec::new(),
         cwd: None,
         scheme: None,
@@ -1061,6 +1118,16 @@ fn write_default(path: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     let mut text = DEFAULT_CONFIG.to_string();
+    #[cfg(windows)]
+    {
+        text = text
+            .replace(
+                "Noto Sans Mono is cosmic-term's default, so it's what Claude Code renders in there.",
+                "Cascadia Mono is Windows Terminal's default.",
+            )
+            .replace("\"Noto Sans Mono\"", &format!("{DEFAULT_FONT:?}"))
+            .replace("\"Open Sans\"", &format!("{DEFAULT_UI_FONT:?}"));
+    }
     let shells = detect_shells();
     text.push_str("\n# Shell profiles. Detected on first run; edit freely.\n# Shells installed later are added to the menu while detect_shells = true.\n");
     text.push_str("# Each profile appears in the new-tab (▾) menu.\n");
@@ -1069,7 +1136,12 @@ fn write_default(path: &Path) -> std::io::Result<()> {
             "\n[[profiles]]\nname = {:?}\ncommand = {:?}\n",
             p.name, p.command
         ));
-        text.push_str("# args = []\n# cwd = \"~\"\n# color_scheme = \"Goblin\"\n# tab_color = \"#7ee787\"\n");
+        if p.args.is_empty() {
+            text.push_str("# args = []\n");
+        } else {
+            text.push_str(&format!("args = {:?}\n", p.args));
+        }
+        text.push_str("# cwd = \"~\"\n# color_scheme = \"Goblin\"\n# tab_color = \"#7ee787\"\n");
     }
     std::fs::write(path, text)
 }

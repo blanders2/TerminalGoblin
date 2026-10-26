@@ -60,14 +60,20 @@ fn run_remote_ls(host: &str, dir: &str) -> Result<(String, Vec<String>), String>
     use std::time::{Duration, Instant};
 
     let dir = crate::config::remote_path_arg(if dir.trim().is_empty() { "~" } else { dir.trim() });
-    let mut child = Command::new("ssh")
+    let mut command = Command::new("ssh");
+    command
         .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", host])
         .arg(format!("cd {dir} && pwd && ls -1Ap"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("could not run ssh: {e}"))?;
+        .stderr(Stdio::piped());
+    // ssh is a console program: don't flash a console window.
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::os::windows::process::CommandExt::creation_flags(&mut command, CREATE_NO_WINDOW);
+    }
+    let mut child = command.spawn().map_err(|e| format!("could not run ssh: {e}"))?;
     // Read both pipes on their own threads so a chatty child can't block on a full pipe.
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
         std::thread::spawn(move || {
@@ -223,15 +229,27 @@ impl Pane {
             .command
             .clone()
             .unwrap_or_else(|| (profile.command.clone(), profile.args.clone()));
+        // The program goes into the command line as is, so quote paths like `C:\Program Files\...`.
+        #[cfg(windows)]
+        let program = if program.contains(' ') && !program.starts_with('"') {
+            format!("\"{program}\"")
+        } else {
+            program
+        };
         let options = tty::Options {
             shell: Some(tty::Shell::new(program, args)),
             working_directory,
             drain_on_exit: true,
             env,
+            #[cfg(windows)]
+            escape_args: true,
         };
         let window_size = window_size(grid, cell);
         let pty = tty::new(&options, window_size, id)?;
+        #[cfg(not(windows))]
         let child_pid = pty.child().id();
+        #[cfg(windows)]
+        let child_pid = pty.child_watcher().pid().map_or(0, |p| p.get());
         let listener = EventProxy { id, proxy };
         let term = Arc::new(FairMutex::new(Term::new(term_config(cfg), &grid, listener.clone())));
         // Drain on exit so a failing command's last words (e.g. ssh's error) reach the screen.
@@ -284,8 +302,16 @@ impl Pane {
     }
 
     /// The shell's current working directory, used to open splits in the same place.
+    #[cfg(not(windows))]
     pub fn cwd(&self) -> Option<PathBuf> {
         std::fs::read_link(format!("/proc/{}/cwd", self.child_pid)).ok()
+    }
+
+    /// Windows has no way to read another process's working directory, so splits open in the
+    /// profile's folder.
+    #[cfg(windows)]
+    pub fn cwd(&self) -> Option<PathBuf> {
+        None
     }
 
     pub fn display_title(&self) -> &str {
