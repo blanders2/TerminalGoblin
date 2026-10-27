@@ -13,3 +13,7 @@ __pycache__/
 
 # Rust build output
 /target/
+
+# Throwaway scripts and generated output (see AGENTS.md)
+/.scratch/
+/.local/
